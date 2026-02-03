@@ -1,0 +1,202 @@
+---
+apiVersion: tekton.dev/v1
+kind: Pipeline
+metadata:
+  name: tenant-push-to-external-registry
+  annotations:
+    tekton.dev/pipelines.minVersion: "0.12.1"
+    tekton.dev/tags: release
+spec:
+  description: >-
+    Tekton pipeline to release Snapshots to an external registry.
+  params:
+    - name: release #good
+      type: string
+      description:
+        The namespaced name (namespace/name) of the Release custom resource initiating this pipeline execution
+    - name: releasePlan #good
+      type: string
+      description: The namespaced name (namespace/name) of the releasePlan
+    - name: snapshot #good
+      type: string
+      description: The namespaced name (namespace/name) of the snapshot
+  workspaces:
+    - name: release-workspace
+  tasks:
+    - name: verify-access-to-resources
+      taskRef:
+        resolver: "git"
+        params:
+          - name: url
+            value: https://github.com/scoheb/release-service-catalog
+          - name: revision
+            value: tenant-release-pipelines
+          - name: pathInRepo
+            value: tasks/verify-access-to-resources/verify-access-to-resources.yaml
+      params:
+        - name: release
+          value: $(params.release)
+        - name: releasePlan
+          value: $(params.releasePlan)
+        - name: snapshot
+          value: $(params.snapshot)
+        - name: requireInternalServices
+          value: "false"
+    - name: collect-data
+      taskRef:
+        resolver: "git"
+        params:
+          - name: url
+            value: https://github.com/scoheb/release-service-catalog
+          - name: revision
+            value: tenant-release-pipelines
+          - name: pathInRepo
+            value: tasks/collect-data/collect-data.yaml
+      params:
+        - name: release
+          value: $(params.release)
+        - name: releasePlan
+          value: $(params.releasePlan)
+        - name: snapshot
+          value: $(params.snapshot)
+        - name: subdirectory
+          value: $(context.pipelineRun.uid)
+      workspaces:
+        - name: data
+          workspace: release-workspace
+      runAfter:
+        - verify-access-to-resources
+    - name: reduce-snapshot
+      taskRef:
+        resolver: "git"
+        params:
+          - name: url
+            value: https://github.com/scoheb/release-service-catalog
+          - name: revision
+            value: tenant-release-pipelines
+          - name: pathInRepo
+            value: tasks/reduce-snapshot/reduce-snapshot.yaml
+      params:
+        - name: SNAPSHOT
+          value: $(workspaces.data.path)/$(tasks.collect-data.results.snapshotSpec)
+        - name: SINGLE_COMPONENT
+          value: $(tasks.collect-data.results.singleComponentMode)
+        - name: SINGLE_COMPONENT_CUSTOM_RESOURCE
+          value: snapshot/$(tasks.collect-data.results.snapshotName)
+        - name: SINGLE_COMPONENT_CUSTOM_RESOURCE_NS
+          value: $(tasks.collect-data.results.snapshotNamespace)
+        - name: SNAPSHOT_PATH
+          value: $(workspaces.data.path)/$(tasks.collect-data.results.snapshotSpec)
+      workspaces:
+        - name: data
+          workspace: release-workspace
+      runAfter:
+        - collect-data
+    - name: apply-mapping
+      taskRef:
+        resolver: "git"
+        params:
+          - name: url
+            value: https://github.com/scoheb/release-service-catalog
+          - name: revision
+            value: tenant-release-pipelines
+          - name: pathInRepo
+            value: tasks/apply-mapping/apply-mapping.yaml
+      params:
+        - name: failOnEmptyResult
+          value: "true"
+        - name: dataPath
+          value: "$(tasks.collect-data.results.data)"
+        - name: snapshotPath
+          value: "$(tasks.collect-data.results.snapshotSpec)"
+      workspaces:
+        - name: config
+          workspace: release-workspace
+      runAfter:
+        - reduce-snapshot
+    - name: create-trusted-artifact-from-workspace
+      taskSpec:
+        params:
+          - name: dataDir
+            description: The location where data will be stored
+            type: string
+            default: /var/workdir/release
+          - name: ociStorage
+            type: string
+            description: The OCI repository where the Trusted Artifacts are stored
+            default: "quay.io/rh-ee-gravid/release-service-trusted-artifacts"
+        results:
+          - name: sourceDataArtifact
+            type: string
+            description: Produced trusted data artifact
+        workspaces:
+          - name: input
+            description: Workspace where the data will be copied from
+        volumes:
+          - name: workdir
+            emptyDir: {}
+        stepTemplate:
+          volumeMounts:
+            - mountPath: /var/workdir
+              name: workdir
+        steps:
+          - name: copy-workspace-data
+            image: quay.io/konflux-ci/release-service-utils@sha256:2f9e6863e82bbc9ddce5a290f3fd0e87657c475e3de8a832b2ef7f8d0671e7d3
+            script: |
+              #!/usr/bin/env bash
+              set -eux
+              
+              cp -r "$(workspaces.input.path)/" "$(params.dataDir)"
+          - name: create-trusted-artifact
+            ref:
+              resolver: "git"
+              params:
+                - name: url
+                  value: https://github.com/konflux-ci/release-service-catalog
+                - name: revision
+                  value: production
+                - name: pathInRepo
+                  value: stepactions/create-trusted-artifact/create-trusted-artifact.yaml
+            params:
+              - name: ociStorage
+                value: $(params.ociStorage)
+              - name: workDir
+                value: $(params.dataDir)
+              - name: sourceDataArtifact
+                value: $(results.sourceDataArtifact.path)
+      workspaces:
+        - name: input
+          workspace: release-workspace
+      runAfter:
+        - apply-mapping
+    - name: push-snapshot
+      when:
+        - input: "$(tasks.apply-mapping.results.mapped)"
+          operator: in
+          values: ["true"]
+      taskRef:
+        resolver: "git"
+        params:
+          - name: url
+            value: https://github.com/konflux-ci/release-service-catalog
+          - name: revision
+            value: production
+          - name: pathInRepo
+            value: tasks/managed/push-snapshot/push-snapshot.yaml
+      params:
+        - name: snapshotPath
+          value: "$(tasks.collect-data.results.snapshotSpec)"
+        - name: dataPath
+          value: "$(tasks.collect-data.results.data)"
+        - name: resultsDirPath
+          value: "$(tasks.collect-data.results.resultsDir)"
+        - name: taskGitUrl
+          value: https://github.com/konflux-ci/release-service-catalog
+        - name: taskGitRevision
+          value: production
+        - name: sourceDataArtifact
+          value: "$(tasks.create-trusted-artifact-from-workspace.results.sourceDataArtifact)"
+        - name: dataDir
+          value: /var/workdir/release
+      runAfter:
+        - create-trusted-artifact-from-workspace
